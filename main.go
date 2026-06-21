@@ -18,6 +18,7 @@ import (
 	"github.com/evplatform/eis-doip-vcu/battery"
 	"github.com/evplatform/eis-doip-vcu/doip"
 	"github.com/evplatform/eis-doip-vcu/iso15765"
+	"github.com/evplatform/eis-doip-vcu/thermal"
 )
 
 type ServiceConfig struct {
@@ -26,8 +27,10 @@ type ServiceConfig struct {
 	HTTPAddr     string
 	VCUSrcAddr   uint16
 	VCUDstAddr   uint16
+	HVDCAddr     uint16
 	EnableUDP    bool
 	EnableTCP    bool
+	AuditLogPath string
 }
 
 type tcpConnEntry struct {
@@ -41,6 +44,7 @@ type DiagnosticService struct {
 	config       ServiceConfig
 	engine       *battery.Engine
 	server       *api.Server
+	hazard       *thermal.HazardDetector
 	udpConn      net.PacketConn
 	udpConnLock  sync.Mutex
 	tcpLn        net.Listener
@@ -59,7 +63,7 @@ func main() {
 	log.Printf("UDP bind: %s (enabled: %v)", cfg.UDPBindAddr, cfg.EnableUDP)
 	log.Printf("TCP bind: %s (enabled: %v)", cfg.TCPBindAddr, cfg.EnableTCP)
 	log.Printf("HTTP API: %s", cfg.HTTPAddr)
-	log.Printf("VCU Source Addr: 0x%04X, Target Addr: 0x%04X", cfg.VCUSrcAddr, cfg.VCUDstAddr)
+	log.Printf("VCU Source Addr: 0x%04X, Target Addr: 0x%04X, HVDC Addr: 0x%04X", cfg.VCUSrcAddr, cfg.VCUDstAddr, cfg.HVDCAddr)
 
 	svc := NewDiagnosticService(cfg)
 	if err := svc.Start(); err != nil {
@@ -83,8 +87,10 @@ func parseFlags() ServiceConfig {
 	httpAddr := flag.String("http-addr", ":8080", "HTTP API bind address")
 	srcAddr := flag.Int("src-addr", 0x0E80, "VCU source diagnostic address")
 	dstAddr := flag.Int("dst-addr", 0x1001, "BMS target diagnostic address")
+	hvdcAddr := flag.Int("hvdc-addr", 0x1010, "HVDC contactor target address")
 	enableUDP := flag.Bool("enable-udp", false, "Enable DoIP UDP listener")
 	enableTCP := flag.Bool("enable-tcp", false, "Enable DoIP TCP listener")
+	auditPath := flag.String("audit-log", "logs/thermal_audit.jsonl", "Thermal audit log file path")
 
 	flag.Parse()
 
@@ -93,8 +99,10 @@ func parseFlags() ServiceConfig {
 	cfg.HTTPAddr = *httpAddr
 	cfg.VCUSrcAddr = uint16(*srcAddr)
 	cfg.VCUDstAddr = uint16(*dstAddr)
+	cfg.HVDCAddr = uint16(*hvdcAddr)
 	cfg.EnableUDP = *enableUDP
 	cfg.EnableTCP = *enableTCP
+	cfg.AuditLogPath = *auditPath
 
 	return cfg
 }
@@ -120,6 +128,8 @@ func (svc *DiagnosticService) Start() error {
 	if !svc.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("service already running")
 	}
+
+	svc.initThermalModule()
 
 	svc.isoParser = iso15765.NewParser(func(msg *iso15765.ReassembledMessage) {
 		svc.server.IncrISO()
@@ -162,8 +172,58 @@ func (svc *DiagnosticService) Start() error {
 	}()
 
 	time.Sleep(200 * time.Millisecond)
-	log.Printf("Service started successfully")
+	log.Printf("Service started successfully with thermal hazard protection enabled")
 	return nil
+}
+
+func (svc *DiagnosticService) initThermalModule() {
+	ekfCfg := thermal.DefaultEKFConfig()
+	ekfCfg.NominalCapacityAh = 80.0
+	ekfCfg.DT = 1e-4
+	ekfCfg.InitialSOC = 0.5
+	ekfCfg.InitialEta = 0.95
+	ekfCfg.InitialPhi = 0.8
+	ekfCfg.InitialRct = 0.05
+	ekfCfg.InitialTau = 1.0
+	ekfCfg.MeasNoiseVoltage = 2e-3
+	ekfCfg.MeasNoiseCurrent = 5e-3
+	ekf := thermal.NewExtendedKalmanFilter(ekfCfg)
+
+	contactorMgr := thermal.NewContactorManager(
+		svc.config.VCUSrcAddr,
+		svc.config.VCUDstAddr,
+		svc.config.HVDCAddr,
+	)
+
+	contactorMgr.SetSendCallback(func(frame []byte, priority uint8) error {
+		switch priority {
+		case thermal.ContactorPriorityEmergency:
+			log.Printf("[EMERGENCY] Sending contactor emergency open command to HVDC 0x%04X", svc.config.HVDCAddr)
+		case thermal.ContactorPriorityHigh:
+			log.Printf("[HIGH] Sending contactor command to HVDC 0x%04X", svc.config.HVDCAddr)
+		default:
+			log.Printf("[NORMAL] Sending contactor command to HVDC 0x%04X", svc.config.HVDCAddr)
+		}
+
+		svc.sendTCPResponse(frame)
+		svc.sendUDPResponse(frame)
+		return nil
+	})
+
+	auditLog := thermal.NewAuditLog(svc.config.AuditLogPath, 10000)
+
+	hazardCfg := thermal.DefaultHazardConfig()
+	hazardCfg.AutoContactorOpen = true
+	hazardCfg.DebounceCount = 3
+	hazardCfg.RecordAllSamples = false
+
+	hd := thermal.NewHazardDetector(hazardCfg, ekf, contactorMgr, auditLog)
+	hd.Start()
+
+	svc.hazard = hd
+	svc.server.SetHazardDetector(hd)
+
+	log.Printf("Thermal hazard protection module initialized (HVDC=0x%04X, audit=%s)", svc.config.HVDCAddr, svc.config.AuditLogPath)
 }
 
 func (svc *DiagnosticService) startUDPListener() error {
@@ -361,6 +421,13 @@ func (svc *DiagnosticService) sendTCPResponse(data []byte) {
 func (svc *DiagnosticService) Stop() {
 	svc.shutdownOnce.Do(func() {
 		svc.running.Store(false)
+
+		if svc.hazard != nil {
+			svc.hazard.Stop()
+			if svc.hazard.Audit() != nil {
+				svc.hazard.Audit().Close()
+			}
+		}
 
 		svc.tcpConnsMu.Lock()
 		for _, entry := range svc.tcpConns {

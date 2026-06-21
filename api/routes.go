@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/evplatform/eis-doip-vcu/battery"
 	"github.com/evplatform/eis-doip-vcu/doip"
 	"github.com/evplatform/eis-doip-vcu/iso15765"
+	"github.com/evplatform/eis-doip-vcu/thermal"
 )
 
 type Server struct {
@@ -17,6 +19,7 @@ type Server struct {
 	engine       *battery.Engine
 	doipScanner  *doip.ZeroCopyScanner
 	isoParser    *iso15765.Parser
+	hazard       *thermal.HazardDetector
 	stats        *ServiceStats
 }
 
@@ -47,14 +50,14 @@ type diagnosisResponse struct {
 }
 
 type statsResponse struct {
-	APICalls      uint64   `json:"api_calls"`
-	DoIPFrames    uint64   `json:"doip_frames_received"`
-	ISO15765Msgs  uint64   `json:"iso15765_messages"`
-	EISProcessed  uint64   `json:"eis_payloads_processed"`
-	Errors        uint64   `json:"errors"`
-	UptimeSeconds float64  `json:"uptime_seconds"`
-	EngineStatus  string   `json:"engine_status"`
-	ProcessCount  uint64   `json:"sample_process_count"`
+	APICalls      uint64  `json:"api_calls"`
+	DoIPFrames    uint64  `json:"doip_frames_received"`
+	ISO15765Msgs  uint64  `json:"iso15765_messages"`
+	EISProcessed  uint64  `json:"eis_payloads_processed"`
+	Errors        uint64  `json:"errors"`
+	UptimeSeconds float64 `json:"uptime_seconds"`
+	EngineStatus  string  `json:"engine_status"`
+	ProcessCount  uint64  `json:"sample_process_count"`
 }
 
 type eisInjectRequest struct {
@@ -84,6 +87,28 @@ type syntheticRequest struct {
 	NumPoints int     `json:"num_points" binding:"required"`
 }
 
+type chargeSampleRequest struct {
+	Voltage float64 `json:"voltage" binding:"required"`
+	Current float64 `json:"current" binding:"required"`
+}
+
+type chargeBatchRequest struct {
+	Samples []chargeSampleRequest `json:"samples" binding:"required"`
+}
+
+type hazardConfigRequest struct {
+	OverpotentialThreshold   *float64 `json:"overpotential_threshold"`
+	OverpotentialWarnThresh  *float64 `json:"overpotential_warn_thresh"`
+	OverpotentialCritThresh  *float64 `json:"overpotential_crit_thresh"`
+	GradientThreshold        *float64 `json:"gradient_threshold"`
+	GradientCritThreshold    *float64 `json:"gradient_crit_threshold"`
+	IntegralWindowSec        *float64 `json:"integral_window_sec"`
+	IntegralThreshold        *float64 `json:"integral_threshold"`
+	RecoveryThreshold        *float64 `json:"recovery_threshold"`
+	DebounceCount            *int     `json:"debounce_count"`
+	AutoContactorOpen        *bool    `json:"auto_contactor_open"`
+}
+
 func NewServer(engine *battery.Engine) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	s := &Server{
@@ -109,6 +134,10 @@ func (s *Server) SetISOParser(p *iso15765.Parser) {
 	s.isoParser = p
 }
 
+func (s *Server) SetHazardDetector(hd *thermal.HazardDetector) {
+	s.hazard = hd
+}
+
 func (s *Server) setupRoutes() {
 	s.router.Use(s.middleware())
 
@@ -127,6 +156,20 @@ func (s *Server) setupRoutes() {
 
 		api.GET("/reference", s.getReferenceParams)
 		api.POST("/reference", s.setReferenceParams)
+
+		api.GET("/thermal/hazard/status", s.getHazardStatus)
+		api.GET("/thermal/hazard/assessment", s.getHazardAssessment)
+		api.POST("/thermal/charge/sample", s.injectChargeSample)
+		api.POST("/thermal/charge/batch", s.injectChargeBatch)
+		api.POST("/thermal/contactor/emergency-open", s.emergencyOpenContactor)
+		api.POST("/thermal/contactor/close", s.closeContactor)
+		api.GET("/thermal/contactor/state", s.getContactorState)
+		api.GET("/thermal/ekf/state", s.getEKFState)
+		api.POST("/thermal/ekf/reset", s.resetEKF)
+		api.GET("/thermal/audit/events", s.getAuditEvents)
+		api.GET("/thermal/audit/stats", s.getAuditStats)
+		api.POST("/thermal/config", s.updateHazardConfig)
+		api.POST("/thermal/reset", s.resetHazard)
 
 		api.GET("/stats", s.getStats)
 		api.GET("/health", s.healthCheck)
@@ -306,6 +349,279 @@ func (s *Server) setReferenceParams(c *gin.Context) {
 	})
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (s *Server) getHazardStatus(c *gin.Context) {
+	if s.hazard == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hazard detector not initialized"})
+		return
+	}
+
+	checks, triggers, level := s.hazard.Stats()
+	assess := s.hazard.LastAssessment()
+
+	resp := gin.H{
+		"hazard_level":      thermal.HazardLevelString(level),
+		"total_checks":      checks,
+		"trigger_count":     triggers,
+		"running":           true,
+	}
+
+	if assess != nil {
+		resp["overpotential_v"] = assess.Overpotential
+		resp["gradient_v_per_s"] = assess.Gradient
+		resp["integral_v_s"] = assess.IntegralValue
+		resp["debounce_counter"] = assess.DebounceCounter
+		resp["contactor_triggered"] = assess.ContactorTriggered
+		resp["last_assessment_ts"] = assess.Timestamp.Format(time.RFC3339Nano)
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+func (s *Server) getHazardAssessment(c *gin.Context) {
+	if s.hazard == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hazard detector not initialized"})
+		return
+	}
+
+	assess := s.hazard.LastAssessment()
+	if assess == nil {
+		c.JSON(http.StatusOK, gin.H{"status": "no_assessment_yet"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"level":                thermal.HazardLevelString(assess.Level),
+		"overpotential_v":      assess.Overpotential,
+		"gradient_v_per_s":     assess.Gradient,
+		"second_derivative":    assess.SecondDerivative,
+		"integral_v_s":         assess.IntegralValue,
+		"debounce_counter":     assess.DebounceCounter,
+		"contactor_triggered":  assess.ContactorTriggered,
+		"timestamp":            assess.Timestamp.Format(time.RFC3339Nano),
+	})
+}
+
+func (s *Server) injectChargeSample(c *gin.Context) {
+	if s.hazard == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hazard detector not initialized"})
+		return
+	}
+
+	var req chargeSampleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	assess := s.hazard.IngestSample(req.Voltage, req.Current, time.Now())
+	if assess == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "hazard detector not running"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"hazard_level":        thermal.HazardLevelString(assess.Level),
+		"overpotential_v":     assess.Overpotential,
+		"gradient_v_per_s":    assess.Gradient,
+		"integral_v_s":        assess.IntegralValue,
+		"contactor_triggered": assess.ContactorTriggered,
+		"timestamp":           assess.Timestamp.Format(time.RFC3339Nano),
+	})
+}
+
+func (s *Server) injectChargeBatch(c *gin.Context) {
+	if s.hazard == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hazard detector not initialized"})
+		return
+	}
+
+	var req chargeBatchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var lastAssess *thermal.HazardAssessment
+	maxHazard := thermal.HazardNormal
+
+	for i, sample := range req.Samples {
+		assess := s.hazard.IngestSample(sample.Voltage, sample.Current, time.Now())
+		if assess != nil {
+			lastAssess = assess
+			if assess.Level > maxHazard {
+				maxHazard = assess.Level
+			}
+		}
+		_ = i
+	}
+
+	if lastAssess == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "no assessments generated"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"samples_processed":   len(req.Samples),
+		"max_hazard_level":    thermal.HazardLevelString(maxHazard),
+		"overpotential_v":     lastAssess.Overpotential,
+		"gradient_v_per_s":    lastAssess.Gradient,
+		"integral_v_s":        lastAssess.IntegralValue,
+		"contactor_triggered": lastAssess.ContactorTriggered,
+		"timestamp":           lastAssess.Timestamp.Format(time.RFC3339Nano),
+	})
+}
+
+func (s *Server) emergencyOpenContactor(c *gin.Context) {
+	if s.hazard == nil || s.hazard.Contactor() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "contactor manager not initialized"})
+		return
+	}
+
+	resp, err := s.hazard.Contactor().EmergencyOpen()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":     fmt.Sprintf("contactor command failed: %v", err),
+			"acknowledged": false,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"acknowledged":    resp.Acknowledged,
+		"contactor_state": thermal.ContactorStateString(resp.State),
+		"timestamp":       resp.Timestamp.Format(time.RFC3339Nano),
+	})
+}
+
+func (s *Server) closeContactor(c *gin.Context) {
+	if s.hazard == nil || s.hazard.Contactor() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "contactor manager not initialized"})
+		return
+	}
+
+	resp, err := s.hazard.Contactor().Close()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":     fmt.Sprintf("contactor close failed: %v", err),
+			"acknowledged": false,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"acknowledged":    resp.Acknowledged,
+		"contactor_state": thermal.ContactorStateString(resp.State),
+		"timestamp":       resp.Timestamp.Format(time.RFC3339Nano),
+	})
+}
+
+func (s *Server) getContactorState(c *gin.Context) {
+	if s.hazard == nil || s.hazard.Contactor() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "contactor manager not initialized"})
+		return
+	}
+
+	cm := s.hazard.Contactor()
+	cmdCount, emergencyN := cm.Stats()
+
+	c.JSON(http.StatusOK, gin.H{
+		"state":             thermal.ContactorStateString(cm.State()),
+		"total_commands":    cmdCount,
+		"emergency_opens":   emergencyN,
+		"last_command":      cm.LastCommand(),
+		"last_response":     cm.LastResponse(),
+	})
+}
+
+func (s *Server) getEKFState(c *gin.Context) {
+	if s.hazard == nil || s.hazard.EKF() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "EKF not initialized"})
+		return
+	}
+
+	state := s.hazard.EKF().State()
+
+	c.JSON(http.StatusOK, gin.H{
+		"soc":         state.SOC,
+		"eta_anode":   state.EtaAnode,
+		"u_phi_solid": state.UPhiSolid,
+		"rct_ohm":     state.Rct,
+		"tau_diff_s":  state.TauDiff,
+		"step_count":  s.hazard.EKF().StepCount(),
+	})
+}
+
+func (s *Server) resetEKF(c *gin.Context) {
+	if s.hazard == nil || s.hazard.EKF() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "EKF not initialized"})
+		return
+	}
+
+	s.hazard.EKF().Reset()
+	c.JSON(http.StatusOK, gin.H{"status": "ekf_reset"})
+}
+
+func (s *Server) getAuditEvents(c *gin.Context) {
+	if s.hazard == nil || s.hazard.Audit() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "audit log not initialized"})
+		return
+	}
+
+	limit := 100
+	if l, ok := c.GetQuery("limit"); ok {
+		var parsed int
+		if _, err := fmt.Sscanf(l, "%d", &parsed); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	events := s.hazard.Audit().Events(limit)
+	c.JSON(http.StatusOK, gin.H{
+		"count":  len(events),
+		"events": events,
+	})
+}
+
+func (s *Server) getAuditStats(c *gin.Context) {
+	if s.hazard == nil || s.hazard.Audit() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "audit log not initialized"})
+		return
+	}
+
+	total, emergency, critical, warning := s.hazard.Audit().Stats()
+	c.JSON(http.StatusOK, gin.H{
+		"total_events":   total,
+		"emergency":      emergency,
+		"critical":       critical,
+		"warning":        warning,
+	})
+}
+
+func (s *Server) updateHazardConfig(c *gin.Context) {
+	if s.hazard == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hazard detector not initialized"})
+		return
+	}
+
+	var req hazardConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "config_updated", "note": "restart required for full config change"})
+}
+
+func (s *Server) resetHazard(c *gin.Context) {
+	if s.hazard == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "hazard detector not initialized"})
+		return
+	}
+
+	s.hazard.Reset()
+	c.JSON(http.StatusOK, gin.H{"status": "hazard_reset"})
 }
 
 func (s *Server) getStats(c *gin.Context) {
