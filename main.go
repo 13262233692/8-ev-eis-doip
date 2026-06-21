@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,14 +30,27 @@ type ServiceConfig struct {
 	EnableTCP    bool
 }
 
+type tcpConnEntry struct {
+	conn    net.Conn
+	scanner *doip.TCPStreamScanner
+	active  atomic.Bool
+	stopMu  sync.Mutex
+}
+
 type DiagnosticService struct {
-	config    ServiceConfig
-	engine    *battery.Engine
-	server    *api.Server
-	udpConn   net.PacketConn
-	tcpLn     net.Listener
-	isoParser *iso15765.Parser
-	scanner   *doip.ZeroCopyScanner
+	config       ServiceConfig
+	engine       *battery.Engine
+	server       *api.Server
+	udpConn      net.PacketConn
+	udpConnLock  sync.Mutex
+	tcpLn        net.Listener
+	tcpLnLock    sync.Mutex
+	isoParser    *iso15765.Parser
+	scanner      *doip.ZeroCopyScanner
+	tcpConns     map[net.Conn]*tcpConnEntry
+	tcpConnsMu   sync.Mutex
+	shutdownOnce sync.Once
+	running      atomic.Bool
 }
 
 func main() {
@@ -93,17 +108,19 @@ func NewDiagnosticService(cfg ServiceConfig) *DiagnosticService {
 	engine := battery.NewEngine(engineCfg)
 	server := api.NewServer(engine)
 
-	isoParser := iso15765.NewParser(nil)
-
 	return &DiagnosticService{
-		config:    cfg,
-		engine:    engine,
-		server:    server,
-		isoParser: isoParser,
+		config:   cfg,
+		engine:   engine,
+		server:   server,
+		tcpConns: make(map[net.Conn]*tcpConnEntry),
 	}
 }
 
 func (svc *DiagnosticService) Start() error {
+	if !svc.running.CompareAndSwap(false, true) {
+		return fmt.Errorf("service already running")
+	}
+
 	svc.isoParser = iso15765.NewParser(func(msg *iso15765.ReassembledMessage) {
 		svc.server.IncrISO()
 		if len(msg.Data) >= 8 {
@@ -116,6 +133,12 @@ func (svc *DiagnosticService) Start() error {
 		}
 	})
 	svc.server.SetISOParser(svc.isoParser)
+
+	svc.isoParser.SetAutoSendFC(true, 0xFF, 0)
+
+	svc.isoParser.SetFlowControlCallback(func(srcAddr, dstAddr uint16, status, blockSize, stMin uint8) {
+		svc.sendFlowControlResponse(srcAddr, dstAddr, status, blockSize, stMin)
+	})
 
 	if svc.config.EnableUDP {
 		if err := svc.startUDPListener(); err != nil {
@@ -132,7 +155,9 @@ func (svc *DiagnosticService) Start() error {
 	go func() {
 		log.Printf("HTTP API server starting on %s", svc.config.HTTPAddr)
 		if err := svc.server.Run(svc.config.HTTPAddr); err != nil {
-			log.Printf("HTTP server error: %v", err)
+			if svc.running.Load() {
+				log.Printf("HTTP server error: %v", err)
+			}
 		}
 	}()
 
@@ -146,7 +171,10 @@ func (svc *DiagnosticService) startUDPListener() error {
 	if err != nil {
 		return fmt.Errorf("udp bind failed: %w", err)
 	}
+
+	svc.udpConnLock.Lock()
 	svc.udpConn = conn
+	svc.udpConnLock.Unlock()
 
 	scanner := doip.NewZeroCopyScanner(conn, func(payload []byte, srcAddr net.Addr, ts time.Time) {
 		svc.server.IncrDoIP()
@@ -156,6 +184,12 @@ func (svc *DiagnosticService) startUDPListener() error {
 	svc.server.SetDoIPScanner(scanner)
 
 	if err := scanner.Start(); err != nil {
+		svc.udpConnLock.Lock()
+		if svc.udpConn != nil {
+			_ = svc.udpConn.Close()
+			svc.udpConn = nil
+		}
+		svc.udpConnLock.Unlock()
 		return fmt.Errorf("scanner start failed: %w", err)
 	}
 
@@ -168,15 +202,26 @@ func (svc *DiagnosticService) startTCPListener() error {
 	if err != nil {
 		return fmt.Errorf("tcp bind failed: %w", err)
 	}
+
+	svc.tcpLnLock.Lock()
 	svc.tcpLn = ln
+	svc.tcpLnLock.Unlock()
 
 	go func() {
-		for {
+		for svc.running.Load() {
 			conn, err := ln.Accept()
 			if err != nil {
-				log.Printf("TCP accept error: %v", err)
+				if svc.running.Load() {
+					log.Printf("TCP accept error: %v", err)
+				}
 				return
 			}
+
+			if !svc.running.Load() {
+				_ = conn.Close()
+				return
+			}
+
 			log.Printf("DoIP TCP connection from %s", conn.RemoteAddr())
 			go svc.handleTCPConnection(conn)
 		}
@@ -187,26 +232,51 @@ func (svc *DiagnosticService) startTCPListener() error {
 }
 
 func (svc *DiagnosticService) handleTCPConnection(conn net.Conn) {
-	defer conn.Close()
+	if conn == nil {
+		return
+	}
+
+	entry := &tcpConnEntry{
+		conn: conn,
+	}
+	entry.active.Store(true)
+
+	svc.tcpConnsMu.Lock()
+	svc.tcpConns[conn] = entry
+	svc.tcpConnsMu.Unlock()
+
+	defer func() {
+		entry.stopMu.Lock()
+		if entry.active.Load() {
+			entry.active.Store(false)
+			if entry.scanner != nil {
+				entry.scanner.Stop()
+			}
+			_ = conn.Close()
+		}
+		entry.stopMu.Unlock()
+
+		svc.tcpConnsMu.Lock()
+		delete(svc.tcpConns, conn)
+		svc.tcpConnsMu.Unlock()
+	}()
 
 	scanner := doip.NewTCPStreamScanner(conn, func(payload []byte, srcAddr net.Addr, ts time.Time) {
+		if !entry.active.Load() {
+			return
+		}
 		svc.server.IncrDoIP()
 		svc.handleDoIPPayload(payload, srcAddr, ts)
 	})
+	entry.scanner = scanner
 
 	if err := scanner.Start(); err != nil {
 		log.Printf("TCP scanner start error: %v", err)
 		return
 	}
 
-	buf := make([]byte, 4096)
-	for {
-		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		_, err := conn.Read(buf)
-		if err != nil {
-			scanner.Stop()
-			return
-		}
+	for svc.running.Load() && entry.active.Load() {
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -228,24 +298,112 @@ func (svc *DiagnosticService) handleDoIPPayload(payload []byte, srcAddr net.Addr
 		diagData = payload[5:]
 	}
 
-	if len(diagData) > 0 {
+	if len(diagData) > 0 && svc.isoParser != nil {
 		_ = svc.isoParser.ProcessFrame(diagData, src, dst, ts)
 	}
 }
 
+func (svc *DiagnosticService) sendFlowControlResponse(srcAddr, dstAddr uint16, status, blockSize, stMin uint8) {
+	isoFC := make([]byte, 3)
+	isoFC[0] = 0x30 | (status & 0x0F)
+	isoFC[1] = blockSize
+	isoFC[2] = stMin
+
+	frame, err := doip.BuildDiagnosticMessage(dstAddr, srcAddr, isoFC)
+	if err != nil {
+		log.Printf("Failed to build DoIP FC frame: %v", err)
+		return
+	}
+
+	svc.sendUDPResponse(frame)
+	svc.sendTCPResponse(frame)
+}
+
+func (svc *DiagnosticService) sendUDPResponse(data []byte) {
+	svc.udpConnLock.Lock()
+	defer svc.udpConnLock.Unlock()
+
+	if svc.udpConn == nil {
+		return
+	}
+
+	broadcastAddr, err := net.ResolveUDPAddr("udp", "255.255.255.255:13400")
+	if err != nil {
+		return
+	}
+
+	_, _ = svc.udpConn.WriteTo(data, broadcastAddr)
+}
+
+func (svc *DiagnosticService) sendTCPResponse(data []byte) {
+	svc.tcpConnsMu.Lock()
+	defer svc.tcpConnsMu.Unlock()
+
+	for _, entry := range svc.tcpConns {
+		if entry == nil || !entry.active.Load() || entry.conn == nil {
+			continue
+		}
+
+		func() {
+			entry.stopMu.Lock()
+			defer entry.stopMu.Unlock()
+
+			if !entry.active.Load() || entry.conn == nil {
+				return
+			}
+
+			_ = entry.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			_, _ = entry.conn.Write(data)
+		}()
+	}
+}
+
 func (svc *DiagnosticService) Stop() {
-	log.Printf("Stopping diagnostic service...")
+	svc.shutdownOnce.Do(func() {
+		svc.running.Store(false)
 
-	if svc.scanner != nil {
-		svc.scanner.Stop()
-	}
-	if svc.udpConn != nil {
-		_ = svc.udpConn.Close()
-	}
-	if svc.tcpLn != nil {
-		_ = svc.tcpLn.Close()
-	}
+		svc.tcpConnsMu.Lock()
+		for _, entry := range svc.tcpConns {
+			if entry == nil {
+				continue
+			}
+			entry.stopMu.Lock()
+			if entry.active.Load() {
+				entry.active.Store(false)
+				if entry.scanner != nil {
+					entry.scanner.Stop()
+				}
+				if entry.conn != nil {
+					_ = entry.conn.Close()
+				}
+			}
+			entry.stopMu.Unlock()
+		}
+		svc.tcpConns = make(map[net.Conn]*tcpConnEntry)
+		svc.tcpConnsMu.Unlock()
 
-	svc.engine.Reset()
-	log.Printf("Service stopped")
+		if svc.scanner != nil {
+			svc.scanner.Stop()
+		}
+
+		svc.udpConnLock.Lock()
+		if svc.udpConn != nil {
+			_ = svc.udpConn.Close()
+			svc.udpConn = nil
+		}
+		svc.udpConnLock.Unlock()
+
+		svc.tcpLnLock.Lock()
+		if svc.tcpLn != nil {
+			_ = svc.tcpLn.Close()
+			svc.tcpLn = nil
+		}
+		svc.tcpLnLock.Unlock()
+
+		if svc.engine != nil {
+			svc.engine.Reset()
+		}
+
+		log.Printf("Service stopped")
+	})
 }
